@@ -1,11 +1,10 @@
 fastapi
 uvicorn
 python-dotenv
-google-generativeai # or together, depending on your current LLM choice
+together
 langchain-community
 langchain-huggingface
 langchain-chroma
 pypdf
 numpy
 sentence-transformers
-together
