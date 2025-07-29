@@ -1,8 +1,10 @@
 fastapi
 uvicorn
-langchain
-faiss-cpu
 python-dotenv
-google-generativeai
+google-generativeai # or together, depending on your current LLM choice
 langchain-community
-huggingface_hub
+langchain-huggingface
+langchain-chroma
+pypdf
+numpy
+sentence-transformers
