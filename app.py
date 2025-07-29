@@ -2,33 +2,63 @@ import os
 import pickle
 import faiss
 import numpy as np
-from fastapi import FastAPI, UploadFile, File, HTTPException
+import re # Import regex module
+from fastapi import FastAPI, UploadFile, File, HTTPException, Header, status
 from pydantic import BaseModel
-from typing import List
+from typing import List, Optional, Dict, Any
 from dotenv import load_dotenv
-import google.generativeai as genai
+# import google.generativeai as genai # Removed Gemini import
+from together import Together # Added Together AI import
 
 # LangChain components
 from langchain.text_splitter import RecursiveCharacterTextSplitter
 from langchain_community.document_loaders import PyPDFLoader
 from langchain_huggingface import HuggingFaceEmbeddings
+from langchain_chroma import Chroma # Updated import for ChromaDB
+from langchain_core.documents import Document
 
 from fastapi.responses import RedirectResponse, HTMLResponse
 
+# --- Pydantic Models (Moved to top for clear definition order) ---
+class QueryRequest(BaseModel):
+    query: str
+
+class HackRxDocument(BaseModel):
+    url: str
+    filename: str # Assuming this filename maps to an already ingested document
+
+class HackRxRequest(BaseModel):
+    documents: Dict[str, List[str]] # Key is URL (unused for now), value is list of filenames
+    questions: Dict[str, List[str]] # Key is filename, value is list of questions
+
+class HackRxResponse(BaseModel):
+    answers: List[str]
+# --- End Pydantic Models ---
+
+
 # --- Load environment variables ---
 load_dotenv()
-GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
-if not GEMINI_API_KEY:
-    raise ValueError("GEMINI_API_KEY not found in .env")
+# Changed GEMINI_API_KEY to TOGETHER_API_KEY
+TOGETHER_API_KEY = os.getenv("TOGETHER_API_KEY")
+if not TOGETHER_API_KEY:
+    raise ValueError("TOGETHER_API_KEY not found in .env")
 
-# --- Configure Gemini ---
-genai.configure(api_key=GEMINI_API_KEY)
-gemini_model = genai.GenerativeModel("gemini-2.5-pro")
+# New: API Key for the /hackrx/run endpoint
+HACKRX_API_KEY = os.getenv("HACKRX_API_KEY")
+if not HACKRX_API_KEY:
+    print("WARNING: HACKRX_API_KEY not found in .env. The /hackrx/run endpoint will not be secured.")
+
+
+# --- Configure Together AI ---
+together_client = Together(api_key=TOGETHER_API_KEY)
+# Define the model to use from Together AI. You can choose another model if preferred.
+# Example models: "mistralai/Mixtral-8x7B-Instruct-v0.1", "lmsys/vicuna-7b-v1.5", "Qwen/Qwen3-235B-A22B-Thinking-2507"
+TOGETHER_LLM_MODEL = "mistralai/Mixtral-8x7B-Instruct-v0.1" 
 
 # --- FastAPI App ---
 app = FastAPI(
     title="Document Q&A RAG System",
-    description="An API for uploading PDFs and querying them using a Gemini LLM.",
+    description="An API for uploading PDFs and querying them using a Together AI LLM.",
 )
 
 @app.get("/", include_in_schema=False)
@@ -118,7 +148,7 @@ async def upload_page():
                 try {{
                     const res = await fetch("/status"); // New endpoint
                     const json = await res.json();
-                    if (json.faiss_index_loaded) {{
+                    if (json.vector_db_loaded) {{
                         statusElem.textContent = `Loaded (${{json.num_chunks}} chunks)`;
                         statusElem.style.color = '#27ae60';
                     }} else {{
@@ -179,7 +209,7 @@ async def upload_page():
                     responseDiv.className = 'error-message';
                     console.error("Upload error:", error);
                 }}
-            }} // Added the missing closing curly brace for uploadFile()
+            }}
 
             async function sendQuery() {{
                 const query = document.getElementById("query").value;
@@ -230,35 +260,30 @@ UPLOAD_DIR = "uploaded_docs"
 os.makedirs(DATA_DIR, exist_ok=True)
 os.makedirs(UPLOAD_DIR, exist_ok=True)
 
-FAISS_INDEX_PATH = os.path.join(DATA_DIR, "faiss_index.bin")
-CHUNKS_MAP_PATH = os.path.join(DATA_DIR, "chunks_map.pkl")
+# Path for ChromaDB persistence
+CHROMA_DB_PATH = os.path.join(DATA_DIR, "chroma_db")
 
 # --- Global State ---
-faiss_index = None
-chunks_data = []
+vector_db: Optional[Chroma] = None
 
 # --- Embedding Model ---
 print("Loading embedding model...")
-# Ensure you have 'sentence-transformers' installed: pip install sentence-transformers
-EMBEDDING_MODEL = HuggingFaceEmbeddings(model_name="all-MiniLM-L6-v2")
+EMBEDDING_MODEL = HuggingFaceEmbeddings(model_name="BAAI/bge-small-en-v1.5")
 print("Embedding model loaded.")
 
-# --- Load Index on Startup ---
+# --- Load Vector Database on Startup ---
 def load_knowledge_base():
-    global faiss_index, chunks_data
-    if os.path.exists(FAISS_INDEX_PATH) and os.path.exists(CHUNKS_MAP_PATH):
-        print("Loading FAISS index and chunks...")
-        try:
-            faiss_index = faiss.read_index(FAISS_INDEX_PATH)
-            with open(CHUNKS_MAP_PATH, "rb") as f:
-                chunks_data = pickle.load(f)
-            print(f"Knowledge base loaded with {len(chunks_data)} chunks.")
-        except Exception as e:
-            print(f"Error loading knowledge base: {e}")
-            faiss_index = None # Reset if loading fails
-            chunks_data = []
-    else:
-        print("Knowledge base not found. Please upload documents to build it.")
+    global vector_db
+    print("Attempting to load ChromaDB knowledge base...")
+    try:
+        vector_db = Chroma(persist_directory=CHROMA_DB_PATH, embedding_function=EMBEDDING_MODEL)
+        if vector_db._collection.count() > 0:
+            print(f"ChromaDB knowledge base loaded with {vector_db._collection.count()} documents.")
+        else:
+            print("ChromaDB initialized but no documents found. Please upload documents.")
+    except Exception as e:
+        print(f"Error loading ChromaDB knowledge base: {e}")
+        vector_db = None
 
 @app.on_event("startup")
 async def startup_event():
@@ -267,25 +292,175 @@ async def startup_event():
 # --- New Endpoint to check Knowledge Base Status ---
 @app.get("/status", summary="Check the status of the knowledge base")
 async def get_kb_status():
-    global faiss_index, chunks_data
+    global vector_db
+    num_chunks = 0
+    vector_db_loaded = False
+    if vector_db:
+        try:
+            num_chunks = vector_db._collection.count()
+            vector_db_loaded = True
+        except Exception as e:
+            print(f"Error getting ChromaDB count: {e}")
+            vector_db_loaded = False
     return {
-        "faiss_index_loaded": faiss_index is not None,
-        "num_chunks": len(chunks_data)
+        "vector_db_loaded": vector_db_loaded,
+        "num_chunks": num_chunks
     }
 
 
-# --- LLM Function ---
+# --- LLM Function (Now uses Together AI) ---
 def call_llm(prompt: str):
     try:
-        response = gemini_model.generate_content(prompt)
-        # Check if response has text attribute before accessing
-        if hasattr(response, 'text') and response.text:
-            return {"answer": response.text.strip()}
+        print(f"DEBUG: Calling LLM with model: {TOGETHER_LLM_MODEL} (Together AI)")
+        messages = [
+            {"role": "user", "content": prompt}
+        ]
+
+        response = together_client.chat.completions.create(
+            model=TOGETHER_LLM_MODEL,
+            messages=messages,
+            max_tokens=500, # Increased max_tokens for potentially longer answers
+            temperature=0.0 # Set temperature to 0.0 for more deterministic answers
+        )
+        
+        if response.choices and response.choices[0].message and response.choices[0].message.content:
+            return {"answer": response.choices[0].message.content.strip()}
         else:
-            return {"error": "LLM returned no content."}
+            return {"error": "Together AI LLM returned no content."}
     except Exception as e:
-        print(f"Error calling LLM: {e}") # Log error for debugging
-        return {"error": f"Failed to get response from LLM: {e}"}
+        print(f"Error calling Together AI LLM: {e}")
+        return {"error": f"Failed to get response from Together AI LLM: {e}"}
+
+# --- Text Cleaning Function for OCR issues ---
+def clean_ocr_text(text: str) -> str:
+    """
+    Cleans text extracted from PDFs that might have extra spaces between characters
+    due to OCR issues (e.g., "T r e a t m e n t" -> "Treatment").
+    This regex attempts to remove single spaces that appear between word characters.
+    """
+    cleaned_text = re.sub(r'(?<=\w)\s(?=\w)', '', text)
+    return cleaned_text
+
+# --- Boilerplate Removal Function ---
+def remove_boilerplate_text(text: str) -> str:
+    """
+    Removes common header/footer/boilerplate text patterns from PDF extracted text.
+    This helps in reducing noise in chunks.
+    """
+    patterns = [
+        # Common policy headers/footers
+        r'Bajaj Allianz General Insurance Co\. Ltd\.',
+        r'Bajaj Allianz House, Airport Road, Yerawada, Pune 411 006\. Reg\. No\.: 113',
+        r'For more details, log on to: www\.bajajallianz\.com \| E-mail: bagichelp@bajajallianz\.co\.in or Call at Sales 1800 209 0144/Service 1800 209 5858 \(Toll Free No\.\)',
+        r'GLOBAL HEALTH CARE',
+        r'Caringly yours',
+        r'B BAJAJ Allianz',
+        r'UIN-BAJHLIP23020V012223',
+        r'Global Health Care/ Policy Wordings/Page \d+', # Matches "Global Health Care/ Policy Wordings/Page X"
+        r'UIN-BAJHLIP23020V012223', # Specific UIN
+        r'Global Health Care/ Policy Wordings/Page \d+', # Page numbers
+        r'--- PAGE \d+ ---', # Common PDF page separator from text extraction
+
+        # Common section headers/footers that repeat
+        r'SECTION A\) PREAMBLE',
+        r'SECTION B\) DEFINITIONS - STANDARD DEFINITIONS',
+        r'SECTION B\) DEFINITIONS - SPECIFIC DEFINITIONS',
+        r'SECTION C\) BENEFITS COVERED UNDER THE POLICY',
+        r'SECTION D\) EXCLUSIONS- STANDARD EXCLUSIONS APPLICABLE TO PART A- DOMESTIC COVER UNDER SECTION C\) BENEFITS COVERED UNDER THE POLICY',
+        r'SECTION D\) EXCLUSIONS-SPECIFIC EXCLUSIONS APPLICABLE TO PART A- DOMESTIC COVER UNDER SECTION C\) BENEFITS COVERED UNDER THE POLICY',
+        r'SECTION D\) EXCLUSIONS- STANDARD EXCLUSIONS APPLICABLE TO PART B- INTERNATIONAL COVER UNDER SECTION C\) BENEFITS COVERED UNDER THE POLICY',
+        r'SECTION D\) EXCLUSIONS-SPECIFIC EXCLUSIONS APPLICABLE TO INTERNATIONAL COVER UNDER SECTION C\) BENEFITS COVERED UNDER THE POLICY',
+        r'SECTION E\) GENERAL TERMS AND CONDITIONS - STANDARD GENERAL TERMS AND CONDITIONS',
+        r'SECTION E\) GENERAL TERMS AND CONDITIONS - SPECIFIC TERMS AND CONDITIONS',
+        r'SECTION E\) GENERAL TERMS AND CLAUSES - STANDARD GENERAL TERMS AND CLAUSES',
+        r'TABLE OF BENEFITS FOR DOMESTIC COVER',
+        r'TABLE OF BENEFITS FOR INTERNATIONAL COVER',
+        r'COVER',
+        r'IMPERIAL PLAN',
+        r'IMPERIAL PLUS PLAN',
+        r'Note: The total Sum Insured payable under all the above covers will not exceed the In-patient Hospitalization Treatment Limits',
+        r'\*The covers will be on cashless basis only\.',
+        r'Out-patient benefits',
+        r'Dental plan benefits \(optional\)',
+        r'Deductible options',
+        r'In-patient benefits',
+        r'Hospital accommodation',
+        r'Pre-hospitalization',
+        r'Post-hospitalization',
+        r'Local \(Road\) Ambulance',
+        r'Day Care Procedures',
+        r'Living Donor Medical Costs',
+        r'Annual Preventive Health Check-up',
+        r'Ayurvedic / Homeopathic Hospitalization Expenses',
+        r'Air Ambulance\*',
+        r'Air Ambulance \+ Medical Evacuation\*',
+        r'Mental Illness Treatment',
+        r'Rehabilitation',
+        r'Accommodation costs for one parent staying in Hospital with an Insured child under 18 years of age Emergency treatment outside area of cover',
+        r'Medical repatriation\*',
+        r'Repatriation of mortal remains\*',
+        r'Inpatient cash Benefit Palliative care',
+        r'Modern Treatment Methods and Advancement in Technologies',
+        r'Maximum out-patient plan benefit for international treatments only',
+        r'Out-patient Treatment',
+        r'Physiotherapy Benefit \(Prescribed Physiotherapy\)',
+        r'Alternate/Complementary Treatment Expenses \(Chiropractic treatment, osteopathy, homeopathy, Chinese herbal medicine, acupuncture and podiatry\)',
+        r'Maximum dental plan benefit for international treatments only',
+        r'Dental treatment outside India',
+        r'Dental surgery outside India',
+        r'Periodontics outside India',
+        r'Deduction towards the proportionate risk premium for period of cover or', # Specific sentence from Free Look Period
+        r'Where only a part of the insurance coverage has commenced, such proportionate premium commensurate with the insurance coverage during such period\.',
+        r'The Policyholder is required at the inception of the Policy to make a nomination for the purpose of payment of claims under the Policy in the event of death of the Policyholder\. Any change of nomination shall be communicated to the Company in writing and such change shall be effective only when an endorsement on the Policy is made\. In the event of death of the Policyholder, the Company will pay the nominee as named in the Policy Schedule/Policy Certificate/Endorsement \(if any\)\} and in case there is no subsisting nominee, to the legal heirs or legal representatives of the Policyholder whose discharge shall be treated as full and final discharge of its liability under the Policy\.',
+        r'In case of any grievance the insured person may contact the Company through',
+        r'Toll free:',
+        r'E-mail:',
+        r'Fax:',
+        r'Courier:',
+        r'Insured Beneficiary may also approach the grievance cell at any of the Company\'s branches with the details of grievance',
+        r'If Insured Beneficiary is not satisfied with the redressal of grievance through one of the above methods, Insured Beneficiary may contact the grievance officer at ggro@bajajallianz\.co\.in',
+        r'For updated details of grievance officer, https://www\.bajajallianz\.com/about-Us/customer-service\.html',
+        r'Grievance may also be lodged at IRDAI Integrated Grievance Management System - https://igms\.irda\.gov\.in/',
+        r'You can further find detailed and Complaints and dispute resolution procedure for International Cover please refer condition 55\. "Additional Grievance Redressal Procedure"\.',
+        r'Office Details',
+        r'Jurisdiction of Office',
+        r'Union Territory, District\)',
+        r'Tel\.: \d{3,4}-\d{7,8}(?:/\d{7,8})?',
+        r'Email: bimalokpal\.[a-z]+\@cioins\.co\.in',
+        r'Note: Address and contact number of Governing Body of Insurance Council',
+        r'Executive Council Of Insurers, 3rd Floor, Jeevan Seva Annexe, S\. V\. Road, Santacruz \(W\), Mumbai - 400 054\.',
+        r'Tel\.: 022-69038801/03/04/05/06/07/08/09',
+        r'Email: inscoun\@cioins\.co\.in',
+        r'Grievance Redressal Cell for Senior Citizens',
+        r'Senior Citizen Cell for Insured Beneficiary who are Senior Citizens',
+        r'\'Good things come with time\' and so for Our customers who are above 60 years of age We have created special cell to address any health insurance related query\. Our senior citizen customers can reach Us through the below dedicated channels to enable Us to service them promptly',
+        r'Health toll free number: 1800-103-2529',
+        r'Exclusive Email address: seniorcitizen@bajajallianz\.co\.in',
+        r'Complaints and dispute resolution procedure for International Cover',
+        r'Our Helpline is always the first number to call if You have any comments or complaints\. If We can\'t resolve the problem on the phone, please email or write to Us:',
+        r'client\.services\@allianzworldwidecare\.com',
+        r'Customer Advocacy Team, Allianz Care, 15 Joyce Way, Park West Business Campus, Nangor Road, Dublin 12, Ireland\.',
+        r'We will handle Your complaint according to Our internal complaint management procedure\. For details see:',
+        r'www\.allianzcare\.com/complaints-procedure',
+        r'You can also contact Our Helpline to obtain a copy of this procedure\.',
+        r'The contact details of the ombudsman offices are mentioned below',
+        r'NationalInsuranceCompanyLimited, PremisesNo\. 18 -0374, Plotno\. CBD -81, New Town, Kolkata - 700156, email: customer\.relations@nic\.co\.in, griho@nic\.co\.in', # Specific grievance contact
+        r'Formoreinformationongrievancemechanism, andtodownloadgrievanceform, visitour', # Common trailing phrase
+        r'11\. REDRESSALOFGRIEVANCE', # Specific grievance heading
+        r'IncaseofanygrievancerelatedtothePolicy, theinsuredpersonmaysubmitinwritingtothePolicyIssuingOfficeorGrievance cellatRegionalOfficeoftheCompanyforredressal\. Ifthegrievanceremainsunaddressed, theinsuredpersonmaycontact:', # Specific grievance text
+        r'CustomerRelationshipManagementDept\.', # Specific department name
+    ]
+    
+    # Compile all patterns into a single regex for efficiency
+    combined_pattern = re.compile('|'.join(patterns), re.IGNORECASE) # IGNORECASE for robustness
+
+    cleaned_text = combined_pattern.sub('', text) # Replace matched patterns with empty string
+    
+    # Remove excessive newlines that might result from stripping boilerplate
+    cleaned_text = re.sub(r'\n{2,}', '\n', cleaned_text).strip()
+    
+    return cleaned_text
+
 
 # --- Ingest Endpoint ---
 @app.post("/ingest", summary="Ingest and process a document")
@@ -300,107 +475,90 @@ async def ingest_document(file: UploadFile = File(...)):
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed to save file: {e}")
 
-
     try:
         loader = PyPDFLoader(file_path)
         documents = loader.load()
-        splitter = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=100)
-        split_chunks = splitter.split_documents(documents)
+        
+        processed_documents = []
+        for doc in documents:
+            # Apply OCR cleaning first
+            cleaned_content = clean_ocr_text(doc.page_content)
+            # Then apply boilerplate removal
+            final_content = remove_boilerplate_text(cleaned_content)
+            
+            # Only add document if content is not empty after cleaning
+            if final_content.strip():
+                processed_documents.append(Document(page_content=final_content, metadata=doc.metadata))
+
+        if not processed_documents:
+            # If all pages became empty after cleaning, raise an error
+            if os.path.exists(file_path):
+                os.remove(file_path)
+            raise HTTPException(status_code=400, detail="No meaningful text found in PDF after cleaning boilerplate.")
+
+        splitter = RecursiveCharacterTextSplitter(chunk_size=1500, chunk_overlap=100)
+        split_chunks = splitter.split_documents(processed_documents) # Use processed_documents
+
     except Exception as e:
-        # Clean up the uploaded file if processing fails
         if os.path.exists(file_path):
             os.remove(file_path)
         raise HTTPException(status_code=500, detail=f"Failed to process PDF: {e}")
 
     if not split_chunks:
-        # Clean up the uploaded file if no text is found
         if os.path.exists(file_path):
             os.remove(file_path)
-        raise HTTPException(status_code=400, detail="No text found in PDF or document is empty.")
+        raise HTTPException(status_code=400, detail="No text found in PDF or document is empty after chunking.")
 
-    global chunks_data
-    current_chunks = [
-        {"text": chunk.page_content, "metadata": {"source": file.filename, "chunk_num": i}}
-        for i, chunk in enumerate(split_chunks)
-    ]
-
-    # Before extending, get the current number of chunks to adjust indices if needed
-    start_index = len(chunks_data)
-    chunks_data.extend(current_chunks)
-
-    texts = [chunk["text"] for chunk in current_chunks]
-    try:
-        embeddings = EMBEDDING_MODEL.embed_documents(texts)
-    except Exception as e:
-        # Rollback chunks if embedding fails
-        chunks_data = chunks_data[:start_index]
-        if os.path.exists(file_path):
-            os.remove(file_path)
-        raise HTTPException(status_code=500, detail=f"Failed to generate embeddings: {e}")
-
-
-    global faiss_index
-    if faiss_index is None:
-        dim = len(embeddings[0])
-        faiss_index = faiss.IndexFlatL2(dim)
+    global vector_db
+    if vector_db is None:
+        load_knowledge_base()
+        if vector_db is None:
+            raise HTTPException(status_code=500, detail="Failed to initialize vector database.")
 
     try:
-        faiss_index.add(np.array(embeddings).astype('float32')) # Ensure embeddings are float32 for FAISS
-        faiss.write_index(faiss_index, FAISS_INDEX_PATH)
-        with open(CHUNKS_MAP_PATH, "wb") as f:
-            pickle.dump(chunks_data, f)
+        docs_to_add = []
+        for i, chunk in enumerate(split_chunks):
+            chunk.metadata["source"] = file.filename
+            chunk.metadata["chunk_num"] = i
+            docs_to_add.append(chunk)
+
+        vector_db.add_documents(docs_to_add)
+
     except Exception as e:
-        # More robust rollback might be needed here for production,
-        # but for this example, we'll just log and raise
-        print(f"Error saving FAISS index or chunks data: {e}")
-        raise HTTPException(status_code=500, detail=f"Failed to persist knowledge base: {e}")
+        print(f"Error adding documents to ChromaDB: {e}")
+        raise HTTPException(status_code=500, detail=f"Failed to add documents to knowledge base: {e}")
 
+    return {"status": "success", "filename": file.filename, "chunks_added": len(split_chunks)}
 
-    return {"status": "success", "filename": file.filename, "chunks_added": len(current_chunks)}
-
-# --- Query Model ---
-class QueryRequest(BaseModel):
-    query: str
-
-# --- Query Endpoint ---
+# --- Query Endpoint (Existing) ---
 @app.post("/query", summary="Ask a question to the documents")
 async def handle_query(request: QueryRequest):
-    global faiss_index, chunks_data
+    global vector_db
 
-    if faiss_index is None or not chunks_data:
+    if vector_db is None or vector_db._collection.count() == 0:
         raise HTTPException(status_code=503, detail="Knowledge base is empty. Please ingest documents first.")
 
     try:
-        query_vector = EMBEDDING_MODEL.embed_query(request.query)
+        retrieved_docs = vector_db.similarity_search(request.query, k=15)
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Failed to embed query: {e}")
-
-    try:
-        # Ensure the query vector is 2D for faiss.search
-        query_vector_2d = np.array([query_vector]).astype('float32') # FAISS expects float32
-        distances, indices = faiss_index.search(query_vector_2d, 5)
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Failed to perform FAISS search: {e}")
-
+        raise HTTPException(status_code=500, detail=f"Failed to perform vector database search: {e}")
 
     retrieved_context = ""
-    # Filter out invalid indices if any (can happen with corrupted index or data mismatch)
-    valid_indices = [idx for idx in indices[0] if 0 <= idx < len(chunks_data)]
-    if not valid_indices:
-        print("Warning: No valid chunks retrieved for the query.")
-        # Fallback: maybe allow LLM to respond without context or give specific error
-        # For now, it will proceed with empty context
-        pass
+    if not retrieved_docs:
+        print("Warning: No documents retrieved for the query.")
+    else:
+        for doc in retrieved_docs:
+            source_info = doc.metadata.get("source", "Unknown Source")
+            chunk_num_info = doc.metadata.get("chunk_num", "N/A")
+            retrieved_context += (
+                f"Source: {source_info}, Chunk {chunk_num_info}\n"
+                f"Content: {doc.page_content}\n---\n"
+            )
 
+    print("\n--- DEBUG: Retrieved Context sent to LLM ---")
+    print(retrieved_context)
+    print("-------------------------------------------\n")
 
-    for idx in valid_indices:
-        chunk_info = chunks_data[idx]
-        retrieved_context += (
-            f"Source: {chunk_info['metadata']['source']}, Chunk {chunk_info['metadata']['chunk_num']}\n"
-            f"Content: {chunk_info['text']}\n---\n"
-        )
-
-    # If no context is retrieved, inform the user or adjust prompt
     if not retrieved_context:
         prompt = f"""
         You are an AI assistant. The user asked: "{request.query}".
@@ -409,7 +567,9 @@ async def handle_query(request: QueryRequest):
     else:
         prompt = f"""
 You are an AI assistant for insurance claim analysis.
-Respond based ONLY on the context below:
+Your task is to determine if a specific surgery mentioned in the User's Query is covered based ONLY on the provided CONTEXT.
+
+First, identify the specific type of surgery from the User's Query.
 
 --- CONTEXT ---
 {retrieved_context}
@@ -418,10 +578,10 @@ Respond based ONLY on the context below:
 User's Query:
 "{request.query}"
 
-Respond in a single sentence:
-- If covered: "Yes, [brief reason]."
-- If not covered: "No, [brief reason]."
-- If the answer is not in the context: "The provided context does not contain enough information to answer."
+Based solely on the CONTEXT, respond in a single sentence:
+- If the context clearly indicates the identified surgery is covered: "Yes, [identified surgery] is covered under the policy."
+- If the context clearly indicates the identified surgery is NOT covered: "No, [identified surgery] is not covered under the policy."
+- If the CONTEXT does not contain sufficient information to determine coverage for the identified surgery: "The provided context does not contain enough information to answer."
         """
 
     llm_response = call_llm(prompt)
@@ -429,3 +589,102 @@ Respond in a single sentence:
         raise HTTPException(status_code=500, detail=llm_response["error"])
 
     return llm_response
+
+# --- New HackRx Endpoint ---
+@app.post("/hackrx/run", response_model=HackRxResponse, summary="HackRx Submission Endpoint")
+async def hackrx_run(
+    request_body: HackRxRequest,
+    authorization: Optional[str] = Header(None)
+):
+    global vector_db
+
+    # --- API Key Authentication ---
+    if HACKRX_API_KEY:
+        if not authorization or not authorization.startswith("Bearer "):
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="Authorization header missing or malformed. Use 'Bearer <api_key>'."
+            )
+        token = authorization.split(" ")[1]
+        if token != HACKRX_API_KEY:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="Invalid API Key."
+            )
+    else:
+        print("WARNING: HACKRX_API_KEY is not set in .env. /hackrx/run endpoint is unsecured.")
+
+    all_answers = []
+
+    # Check if knowledge base is ready before processing questions
+    if vector_db is None or vector_db._collection.count() == 0:
+        # If no documents are ingested, return a default "not enough info" for all questions
+        for doc_filename, questions_list in request_body.questions.items():
+            for question_text in questions_list:
+                all_answers.append("The provided context does not contain enough information to answer.")
+        return HackRxResponse(answers=all_answers)
+
+
+    # Iterate through documents and their questions
+    for doc_filename, questions_list in request_body.questions.items():
+        # In this simplified RAG, we query the entire vector_db.
+        # For a more advanced setup, you could filter retrieval by source if ChromaDB supported it easily
+        # or if you had a more complex metadata indexing strategy.
+
+        for question_text in questions_list:
+            retrieved_context = ""
+            try:
+                # Retrieve relevant documents for the current question
+                # We use k=15 as defined for the /query endpoint
+                retrieved_docs = vector_db.similarity_search(question_text, k=15)
+
+                if not retrieved_docs:
+                    print(f"Warning: No documents retrieved for question: {question_text} from {doc_filename}")
+                else:
+                    for doc in retrieved_docs:
+                        source_info = doc.metadata.get("source", "Unknown Source")
+                        chunk_num_info = doc.metadata.get("chunk_num", "N/A")
+                        retrieved_context += (
+                            f"Source: {source_info}, Chunk {chunk_num_info}\n"
+                            f"Content: {doc.page_content}\n---\n"
+                        )
+
+                # Construct the prompt for the LLM
+                if not retrieved_context:
+                    prompt = f"""
+                    You are an AI assistant. The user asked: "{question_text}".
+                    I could not find any relevant information in the documents. Please state that you don't have enough information to answer.
+                    """
+                else:
+                    prompt = f"""
+You are an AI assistant for insurance claim analysis.
+Your task is to determine if a specific surgery mentioned in the User's Query is covered based ONLY on the provided CONTEXT.
+
+First, identify the specific type of surgery from the User's Query.
+
+--- CONTEXT ---
+{retrieved_context}
+--- END CONTEXT ---
+
+User's Query:
+"{question_text}"
+
+Based solely on the CONTEXT, respond in a single sentence:
+- If the context clearly indicates the identified surgery is covered: "Yes, [identified surgery] is covered under the policy."
+- If the context clearly indicates the identified surgery is NOT covered: "No, [identified surgery] is not covered under the policy."
+- If the CONTEXT does not contain sufficient information to determine coverage for the identified surgery: "The provided context does not contain enough information to answer."
+                    """
+                
+                # Call the LLM
+                llm_response = call_llm(prompt)
+                if "error" in llm_response:
+                    all_answers.append(f"Error processing question: {llm_response['error']}")
+                else:
+                    all_answers.append(llm_response['answer'])
+
+            except Exception as e:
+                # Catch any unexpected errors during processing a question
+                print(f"Error processing question '{question_text}' for document '{doc_filename}': {e}")
+                all_answers.append(f"An internal error occurred while processing this question.")
+
+    return HackRxResponse(answers=all_answers)
