@@ -1,0 +1,8 @@
+fastapi
+uvicorn
+langchain
+faiss-cpu
+python-dotenv
+google-generativeai
+langchain-community
+huggingface_hub
