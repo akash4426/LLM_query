@@ -8,3 +8,4 @@ langchain-chroma
 pypdf
 numpy
 sentence-transformers
+together
