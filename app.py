@@ -7,7 +7,8 @@ from fastapi import FastAPI, UploadFile, File, HTTPException, Header, status
 from pydantic import BaseModel
 from typing import List, Optional, Dict, Any
 from dotenv import load_dotenv
-import google.generativeai as genai # Added Gemini import
+# import google.generativeai as genai # Removed Gemini import
+from together import Together # Added Together AI import
 
 # LangChain components
 from langchain.text_splitter import RecursiveCharacterTextSplitter
@@ -37,9 +38,10 @@ class HackRxResponse(BaseModel):
 
 # --- Load environment variables ---
 load_dotenv()
-GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
-if not GEMINI_API_KEY:
-    raise ValueError("GEMINI_API_KEY not found in .env")
+# Changed GEMINI_API_KEY to TOGETHER_API_KEY
+TOGETHER_API_KEY = os.getenv("TOGETHER_API_KEY")
+if not TOGETHER_API_KEY:
+    raise ValueError("TOGETHER_API_KEY not found in .env")
 
 # New: API Key for the /hackrx/run endpoint
 HACKRX_API_KEY = os.getenv("HACKRX_API_KEY")
@@ -47,14 +49,16 @@ if not HACKRX_API_KEY:
     print("WARNING: HACKRX_API_KEY not found in .env. The /hackrx/run endpoint will not be secured.")
 
 
-# --- Configure Gemini ---
-genai.configure(api_key=GEMINI_API_KEY)
-gemini_model = genai.GenerativeModel("gemini-2.0-flash") # Using gemini-2.0-flash
+# --- Configure Together AI ---
+together_client = Together(api_key=TOGETHER_API_KEY)
+# Define the model to use from Together AI. You can choose another model if preferred.
+# Example models: "mistralai/Mixtral-8x7B-Instruct-v0.1", "lmsys/vicuna-7b-v1.5", "Qwen/Qwen3-235B-A22B-Thinking-2507"
+TOGETHER_LLM_MODEL = "mistralai/Mixtral-8x7B-Instruct-v0.1" 
 
 # --- FastAPI App ---
 app = FastAPI(
     title="Document Q&A RAG System",
-    description="An API for uploading PDFs and querying them using a Gemini LLM.",
+    description="An API for uploading PDFs and querying them using a Together AI LLM.",
 )
 
 @app.get("/", include_in_schema=False)
@@ -304,19 +308,28 @@ async def get_kb_status():
     }
 
 
-# --- LLM Function (Now uses Gemini) ---
+# --- LLM Function (Now uses Together AI) ---
 def call_llm(prompt: str):
     try:
-        print(f"DEBUG: Calling LLM with model: {gemini_model.model_name} (Gemini)")
-        response = gemini_model.generate_content(prompt)
+        print(f"DEBUG: Calling LLM with model: {TOGETHER_LLM_MODEL} (Together AI)")
+        messages = [
+            {"role": "user", "content": prompt}
+        ]
+
+        response = together_client.chat.completions.create(
+            model=TOGETHER_LLM_MODEL,
+            messages=messages,
+            max_tokens=500, # Increased max_tokens for potentially longer answers
+            temperature=0.0 # Set temperature to 0.0 for more deterministic answers
+        )
         
-        if hasattr(response, 'text') and response.text:
-            return {"answer": response.text.strip()}
+        if response.choices and response.choices[0].message and response.choices[0].message.content:
+            return {"answer": response.choices[0].message.content.strip()}
         else:
-            return {"error": "Gemini LLM returned no content."}
+            return {"error": "Together AI LLM returned no content."}
     except Exception as e:
-        print(f"Error calling Gemini LLM: {e}")
-        return {"error": f"Failed to get response from Gemini LLM: {e}"}
+        print(f"Error calling Together AI LLM: {e}")
+        return {"error": f"Failed to get response from Together AI LLM: {e}"}
 
 # --- Text Cleaning Function for OCR issues ---
 def clean_ocr_text(text: str) -> str:
