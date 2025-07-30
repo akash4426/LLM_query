@@ -1,14 +1,13 @@
 import os
 import pickle
-import faiss
+# import faiss # REMOVED: No longer directly used after switching to ChromaDB
 import numpy as np
 import re # Import regex module
 from fastapi import FastAPI, UploadFile, File, HTTPException, Header, status
 from pydantic import BaseModel
 from typing import List, Optional, Dict, Any
 from dotenv import load_dotenv
-# import google.generativeai as genai # Removed Gemini import
-from together import Together # Added Together AI import
+import google.generativeai as genai # Added Gemini import
 
 # LangChain components
 from langchain.text_splitter import RecursiveCharacterTextSplitter
@@ -38,10 +37,9 @@ class HackRxResponse(BaseModel):
 
 # --- Load environment variables ---
 load_dotenv()
-# Changed GEMINI_API_KEY to TOGETHER_API_KEY
-TOGETHER_API_KEY = os.getenv("TOGETHER_API_KEY")
-if not TOGETHER_API_KEY:
-    raise ValueError("TOGETHER_API_KEY not found in .env")
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
+if not GEMINI_API_KEY:
+    raise ValueError("GEMINI_API_KEY not found in .env")
 
 # New: API Key for the /hackrx/run endpoint
 HACKRX_API_KEY = os.getenv("HACKRX_API_KEY")
@@ -49,16 +47,14 @@ if not HACKRX_API_KEY:
     print("WARNING: HACKRX_API_KEY not found in .env. The /hackrx/run endpoint will not be secured.")
 
 
-# --- Configure Together AI ---
-together_client = Together(api_key=TOGETHER_API_KEY)
-# Define the model to use from Together AI. You can choose another model if preferred.
-# Example models: "mistralai/Mixtral-8x7B-Instruct-v0.1", "lmsys/vicuna-7b-v1.5", "Qwen/Qwen3-235B-A22B-Thinking-2507"
-TOGETHER_LLM_MODEL = "mistralai/Mixtral-8x7B-Instruct-v0.1" 
+# --- Configure Gemini ---
+genai.configure(api_key=GEMINI_API_KEY)
+gemini_model = genai.GenerativeModel("gemini-2.0-flash") # Using gemini-2.0-flash
 
 # --- FastAPI App ---
 app = FastAPI(
     title="Document Q&A RAG System",
-    description="An API for uploading PDFs and querying them using a Together AI LLM.",
+    description="An API for uploading PDFs and querying them using a Gemini LLM.",
 )
 
 @app.get("/", include_in_schema=False)
@@ -308,28 +304,19 @@ async def get_kb_status():
     }
 
 
-# --- LLM Function (Now uses Together AI) ---
+# --- LLM Function (Now uses Gemini) ---
 def call_llm(prompt: str):
     try:
-        print(f"DEBUG: Calling LLM with model: {TOGETHER_LLM_MODEL} (Together AI)")
-        messages = [
-            {"role": "user", "content": prompt}
-        ]
-
-        response = together_client.chat.completions.create(
-            model=TOGETHER_LLM_MODEL,
-            messages=messages,
-            max_tokens=500, # Increased max_tokens for potentially longer answers
-            temperature=0.0 # Set temperature to 0.0 for more deterministic answers
-        )
+        print(f"DEBUG: Calling LLM with model: {gemini_model.model_name} (Gemini)")
+        response = gemini_model.generate_content(prompt)
         
-        if response.choices and response.choices[0].message and response.choices[0].message.content:
-            return {"answer": response.choices[0].message.content.strip()}
+        if hasattr(response, 'text') and response.text:
+            return {"answer": response.text.strip()}
         else:
-            return {"error": "Together AI LLM returned no content."}
+            return {"error": "Gemini LLM returned no content."}
     except Exception as e:
-        print(f"Error calling Together AI LLM: {e}")
-        return {"error": f"Failed to get response from Together AI LLM: {e}"}
+        print(f"Error calling Gemini LLM: {e}")
+        return {"error": f"Failed to get response from Gemini LLM: {e}"}
 
 # --- Text Cleaning Function for OCR issues ---
 def clean_ocr_text(text: str) -> str:
@@ -378,6 +365,23 @@ def remove_boilerplate_text(text: str) -> str:
         r'COVER',
         r'IMPERIAL PLAN',
         r'IMPERIAL PLUS PLAN',
+        r'USD \d{1,3},\d{3,3}', # Matches USD amounts like USD 100,000
+        r'INR \d{1,3},\d{3,3}', # Matches INR amounts like INR 500,000
+        r'NA', # Common for Not Applicable in tables
+        r'\d+\s+Stapedotomy', # Specific list items that look like headers
+        r'\d+\s+Myringoplasty \(Type I Tympanoplasty\)',
+        r'ENT',
+        r'General Surgery',
+        r'Oncology',
+        r'Urology',
+        r'Neurology',
+        r'Thoracic surgery',
+        r'Gastroenterology',
+        r'Orthopedics',
+        r'Plastic',
+        r'Critical care',
+        r'Gynaecology',
+        r'Paediatric surgery',
         r'Note: The total Sum Insured payable under all the above covers will not exceed the In-patient Hospitalization Treatment Limits',
         r'\*The covers will be on cashless basis only\.',
         r'Out-patient benefits',
