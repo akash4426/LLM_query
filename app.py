@@ -1,3 +1,4 @@
+
 import os
 import pickle
 # import faiss # REMOVED: No longer directly used after switching to ChromaDB
@@ -51,9 +52,10 @@ if not HACKRX_API_KEY:
 
 # --- Configure Together AI ---
 together_client = Together(api_key=TOGETHER_API_KEY)
-# Define the model to use from Together AI. You can choose another model if preferred.
-# Example models: "mistralai/Mixtral-8x7B-Instruct-v0.1", "lmsys/vicuna-7b-v1.5", "Qwen/Qwen3-235B-A22B-Thinking-2507"
-TOGETHER_LLM_MODEL = "mistralai/Mixtral-8x7B-Instruct-v0.1" 
+# Define the model to use from Together AI.
+# Changed to meta-llama/Llama-3-8b-chat-hf as a highly performant model.
+# Other excellent options include: "mistralai/Mixtral-8x7B-Instruct-v0.1", "Qwen/Qwen1.5-72B-Chat"
+TOGETHER_LLM_MODEL = "meta-llama/Llama-3-8b-chat-hf" 
 
 # --- FastAPI App ---
 app = FastAPI(
@@ -337,146 +339,60 @@ def clean_ocr_text(text: str) -> str:
     Cleans text extracted from PDFs that might have extra spaces between characters
     due to OCR issues (e.g., "T r e a t m e n t" -> "Treatment").
     This regex attempts to remove single spaces that appear between word characters.
+    It also attempts to split concatenated words (e.g., "Contractmeans" -> "Contract means").
     """
+    # 1. Remove single spaces between characters (original fix for "T r e a t m e n t")
     cleaned_text = re.sub(r'(?<=\w)\s(?=\w)', '', text)
+
+    # 2. Attempt to split concatenated words:
+    #    - Insert space before an uppercase letter followed by a lowercase letter (e.g., "WordStarts" -> "Word Starts")
+    #    - Insert space before a digit that follows a letter (e.g., "text123" -> "text 123")
+    #    - Insert space before a non-digit that follows a digit (e.g., "123text" -> "123 text")
+    # This is heuristic and might not catch all cases or might introduce new errors.
+    cleaned_text = re.sub(r'([a-z])([A-Z])', r'\1 \2', cleaned_text) # lowercase followed by uppercase
+    cleaned_text = re.sub(r'(\D)(\d)', r'\1 \2', cleaned_text)     # non-digit followed by digit
+    cleaned_text = re.sub(r'(\d)(\D)', r'\1 \2', cleaned_text)     # digit followed by non-digit
+
+    # Specific common merged words (can be expanded based on observation)
+    # These are added to handle specific observed concatenations more robustly
+    cleaned_text = re.sub(r'Contractmeans', 'Contract means', cleaned_text, flags=re.IGNORECASE)
+    cleaned_text = re.sub(r'Policyandthe', 'Policy and the', cleaned_text, flags=re.IGNORECASE)
+    cleaned_text = re.sub(r'Co-paymentmeans', 'Co-payment means', cleaned_text, flags=re.IGNORECASE)
+    cleaned_text = re.sub(r'CumulativeBonusmeans', 'Cumulative Bonus means', cleaned_text, flags=re.IGNORECASE)
+    cleaned_text = re.sub(r'IncaseofanygrievancerelatedtothePolicy, theinsuredpersonmaysubmitinwritingtothePolicyIssuingOfficeorGrievancecellatRegionalOfficeoftheCompanyforredressal.', 'In case of any grievance related to the Policy, the insured person may submit in writing to the Policy Issuing Office or Grievance cell at Regional Office of the Company for redressal.', cleaned_text, flags=re.IGNORECASE)
+    cleaned_text = re.sub(r'Ifthegrievanceremainsunaddressed, theinsuredpersonmaysubmitinwritingtothePolicyIssuingOfficeorGrievancecellatRegionalOfficeoftheCompanyforredressal.', 'If the grievance remains unaddressed, the insured person may submit in writing to the Policy Issuing Office or Grievance cell at Regional Office of the Company for redressal.', cleaned_text, flags=re.IGNORECASE) # Duplicated, but harmless
+    cleaned_text = re.sub(r'Formoreinformationongrievancemechanism, andtodownloadgrievanceform, visitour', 'For more information on grievance mechanism, and to download grievance form, visit our', cleaned_text, flags=re.IGNORECASE)
+    cleaned_text = re.sub(r'CustomerRelationshipManagementDept\.', 'Customer Relationship Management Dept.', cleaned_text, flags=re.IGNORECASE)
+    cleaned_text = re.sub(r'NationalInsuranceCompanyLimited, PremisesNo\. 18 -0374, Plotno\. CBD -81, New Town, Kolkata - 700156, email: customer\.relations@nic\.co\.in, griho@nic\.co\.in', 'National Insurance Company Limited, Premises No. 18-0374, Plot no. CBD-81, New Town, Kolkata - 700156, email: customer.relations@nic.co.in, griho@nic.co.in', cleaned_text, flags=re.IGNORECASE)
+    cleaned_text = re.sub(r'REDRESSALOFGRIEVANCE', 'REDRESSAL OF GRIEVANCE', cleaned_text, flags=re.IGNORECASE)
+
+
+    # Normalize spaces (replace multiple spaces with a single one)
+    cleaned_text = re.sub(r'\s+', ' ', cleaned_text).strip()
+
     return cleaned_text
 
-# --- Boilerplate Removal Function ---
+# --- Boilerplate Removal Function (ADDED TO FIX THE ERROR) ---
 def remove_boilerplate_text(text: str) -> str:
     """
-    Removes common header/footer/boilerplate text patterns from PDF extracted text.
-    This helps in reducing noise in chunks.
+    Removes common boilerplate text like headers, footers, page numbers,
+    and specific policy identifiers from the document text.
     """
+    # Patterns to remove (case-insensitive)
     patterns = [
-        # Common policy headers/footers
-        r'Bajaj Allianz General Insurance Co\. Ltd\.',
-        r'Bajaj Allianz House, Airport Road, Yerawada, Pune 411 006\. Reg\. No\.: 113',
-        r'For more details, log on to: www\.bajajallianz\.com \| E-mail: bagichelp@bajajallianz\.co\.in or Call at Sales 1800 209 0144/Service 1800 209 5858 \(Toll Free No\.\)',
-        r'GLOBAL HEALTH CARE',
-        r'Caringly yours',
-        r'B BAJAJ Allianz',
-        r'UIN-BAJHLIP23020V012223',
-        r'Global Health Care/ Policy Wordings/Page \d+', # Matches "Global Health Care/ Policy Wordings/Page X"
-        r'UIN-BAJHLIP23020V012223', # Specific UIN
-        r'Global Health Care/ Policy Wordings/Page \d+', # Page numbers
-        r'--- PAGE \d+ ---', # Common PDF page separator from text extraction
-
-        # Common section headers/footers that repeat
-        r'SECTION A\) PREAMBLE',
-        r'SECTION B\) DEFINITIONS - STANDARD DEFINITIONS',
-        r'SECTION B\) DEFINITIONS - SPECIFIC DEFINITIONS',
-        r'SECTION C\) BENEFITS COVERED UNDER THE POLICY',
-        r'SECTION D\) EXCLUSIONS- STANDARD EXCLUSIONS APPLICABLE TO PART A- DOMESTIC COVER UNDER SECTION C\) BENEFITS COVERED UNDER THE POLICY',
-        r'SECTION D\) EXCLUSIONS-SPECIFIC EXCLUSIONS APPLICABLE TO PART A- DOMESTIC COVER UNDER SECTION C\) BENEFITS COVERED UNDER THE POLICY',
-        r'SECTION D\) EXCLUSIONS- STANDARD EXCLUSIONS APPLICABLE TO PART B- INTERNATIONAL COVER UNDER SECTION C\) BENEFITS COVERED UNDER THE POLICY',
-        r'SECTION D\) EXCLUSIONS-SPECIFIC EXCLUSIONS APPLICABLE TO INTERNATIONAL COVER UNDER SECTION C\) BENEFITS COVERED UNDER THE POLICY',
-        r'SECTION E\) GENERAL TERMS AND CONDITIONS - STANDARD GENERAL TERMS AND CONDITIONS',
-        r'SECTION E\) GENERAL TERMS AND CONDITIONS - SPECIFIC TERMS AND CONDITIONS',
-        r'SECTION E\) GENERAL TERMS AND CLAUSES - STANDARD GENERAL TERMS AND CLAUSES',
-        r'TABLE OF BENEFITS FOR DOMESTIC COVER',
-        r'TABLE OF BENEFITS FOR INTERNATIONAL COVER',
-        r'COVER',
-        r'IMPERIAL PLAN',
-        r'IMPERIAL PLUS PLAN',
-        r'USD \d{1,3},\d{3,3}', # Matches USD amounts like USD 100,000
-        r'INR \d{1,3},\d{3,3}', # Matches INR amounts like INR 500,000
-        r'NA', # Common for Not Applicable in tables
-        r'\d+\s+Stapedotomy', # Specific list items that look like headers
-        r'\d+\s+Myringoplasty \(Type I Tympanoplasty\)',
-        r'ENT',
-        r'General Surgery',
-        r'Oncology',
-        r'Urology',
-        r'Neurology',
-        r'Thoracic surgery',
-        r'Gastroenterology',
-        r'Orthopedics',
-        r'Plastic',
-        r'Critical care',
-        r'Gynaecology',
-        r'Paediatric surgery',
-        r'Note: The total Sum Insured payable under all the above covers will not exceed the In-patient Hospitalization Treatment Limits',
-        r'\*The covers will be on cashless basis only\.',
-        r'Out-patient benefits',
-        r'Dental plan benefits \(optional\)',
-        r'Deductible options',
-        r'In-patient benefits',
-        r'Hospital accommodation',
-        r'Pre-hospitalization',
-        r'Post-hospitalization',
-        r'Local \(Road\) Ambulance',
-        r'Day Care Procedures',
-        r'Living Donor Medical Costs',
-        r'Annual Preventive Health Check-up',
-        r'Ayurvedic / Homeopathic Hospitalization Expenses',
-        r'Air Ambulance\*',
-        r'Air Ambulance \+ Medical Evacuation\*',
-        r'Mental Illness Treatment',
-        r'Rehabilitation',
-        r'Accommodation costs for one parent staying in Hospital with an Insured child under 18 years of age Emergency treatment outside area of cover',
-        r'Medical repatriation\*',
-        r'Repatriation of mortal remains\*',
-        r'Inpatient cash Benefit Palliative care',
-        r'Modern Treatment Methods and Advancement in Technologies',
-        r'Maximum out-patient plan benefit for international treatments only',
-        r'Out-patient Treatment',
-        r'Physiotherapy Benefit \(Prescribed Physiotherapy\)',
-        r'Alternate/Complementary Treatment Expenses \(Chiropractic treatment, osteopathy, homeopathy, Chinese herbal medicine, acupuncture and podiatry\)',
-        r'Maximum dental plan benefit for international treatments only',
-        r'Dental treatment outside India',
-        r'Dental surgery outside India',
-        r'Periodontics outside India',
-        r'Deduction towards the proportionate risk premium for period of cover or', # Specific sentence from Free Look Period
-        r'Where only a part of the insurance coverage has commenced, such proportionate premium commensurate with the insurance coverage during such period\.',
-        r'The Policyholder is required at the inception of the Policy to make a nomination for the purpose of payment of claims under the Policy in the event of death of the Policyholder\. Any change of nomination shall be communicated to the Company in writing and such change shall be effective only when an endorsement on the Policy is made\. In the event of death of the Policyholder, the Company will pay the nominee as named in the Policy Schedule/Policy Certificate/Endorsement \(if any\)\} and in case there is no subsisting nominee, to the legal heirs or legal representatives of the Policyholder whose discharge shall be treated as full and final discharge of its liability under the Policy\.',
-        r'In case of any grievance the insured person may contact the Company through',
-        r'Toll free:',
-        r'E-mail:',
-        r'Fax:',
-        r'Courier:',
-        r'Insured Beneficiary may also approach the grievance cell at any of the Company\'s branches with the details of grievance',
-        r'If Insured Beneficiary is not satisfied with the redressal of grievance through one of the above methods, Insured Beneficiary may contact the grievance officer at ggro@bajajallianz\.co\.in',
-        r'For updated details of grievance officer, https://www\.bajajallianz\.com/about-Us/customer-service\.html',
-        r'Grievance may also be lodged at IRDAI Integrated Grievance Management System - https://igms\.irda\.gov\.in/',
-        r'You can further find detailed and Complaints and dispute resolution procedure for International Cover please refer condition 55\. "Additional Grievance Redressal Procedure"\.',
-        r'Office Details',
-        r'Jurisdiction of Office',
-        r'Union Territory, District\)',
-        r'Tel\.: \d{3,4}-\d{7,8}(?:/\d{7,8})?',
-        r'Email: bimalokpal\.[a-z]+\@cioins\.co\.in',
-        r'Note: Address and contact number of Governing Body of Insurance Council',
-        r'Executive Council Of Insurers, 3rd Floor, Jeevan Seva Annexe, S\. V\. Road, Santacruz \(W\), Mumbai - 400 054\.',
-        r'Tel\.: 022-69038801/03/04/05/06/07/08/09',
-        r'Email: inscoun\@cioins\.co\.in',
-        r'Grievance Redressal Cell for Senior Citizens',
-        r'Senior Citizen Cell for Insured Beneficiary who are Senior Citizens',
-        r'\'Good things come with time\' and so for Our customers who are above 60 years of age We have created special cell to address any health insurance related query\. Our senior citizen customers can reach Us through the below dedicated channels to enable Us to service them promptly',
-        r'Health toll free number: 1800-103-2529',
-        r'Exclusive Email address: seniorcitizen@bajajallianz\.co\.in',
-        r'Complaints and dispute resolution procedure for International Cover',
-        r'Our Helpline is always the first number to call if You have any comments or complaints\. If We can\'t resolve the problem on the phone, please email or write to Us:',
-        r'client\.services\@allianzworldwidecare\.com',
-        r'Customer Advocacy Team, Allianz Care, 15 Joyce Way, Park West Business Campus, Nangor Road, Dublin 12, Ireland\.',
-        r'We will handle Your complaint according to Our internal complaint management procedure\. For details see:',
-        r'www\.allianzcare\.com/complaints-procedure',
-        r'You can also contact Our Helpline to obtain a copy of this procedure\.',
-        r'The contact details of the ombudsman offices are mentioned below',
-        r'NationalInsuranceCompanyLimited, PremisesNo\. 18 -0374, Plotno\. CBD -81, New Town, Kolkata - 700156, email: customer\.relations@nic\.co\.in, griho@nic\.co\.in', # Specific grievance contact
-        r'Formoreinformationongrievancemechanism, andtodownloadgrievanceform, visitour', # Common trailing phrase
-        r'11\. REDRESSALOFGRIEVANCE', # Specific grievance heading
-        r'IncaseofanygrievancerelatedtothePolicy, theinsuredpersonmaysubmitinwritingtothePolicyIssuingOfficeorGrievance cellatRegionalOfficeoftheCompanyforredressal\. Ifthegrievanceremainsunaddressed, theinsuredpersonmaycontact:', # Specific grievance text
-        r'CustomerRelationshipManagementDept\.', # Specific department name
+        r'Page\s*\d+\s*of\s*\d+',                # "Page X of Y"
+        r'NATIONAL INSURANCE COMPANY LIMITED',      # Company name header
+        r'Policy No\.:\s*[\w-]+',                 # "Policy No.: ..."
+        r'UIN:\s*[\w-]+',                        # "UIN: ..."
+        # Add any other repeating headers or footers you observe in your documents
     ]
     
-    # Compile all patterns into a single regex for efficiency
-    combined_pattern = re.compile('|'.join(patterns), re.IGNORECASE) # IGNORECASE for robustness
+    cleaned_text = text
+    for pattern in patterns:
+        cleaned_text = re.sub(pattern, '', cleaned_text, flags=re.IGNORECASE)
 
-    cleaned_text = combined_pattern.sub('', text) # Replace matched patterns with empty string
-    
-    # Remove excessive newlines that might result from stripping boilerplate
-    cleaned_text = re.sub(r'\n{2,}', '\n', cleaned_text).strip()
-    
-    return cleaned_text
+    # Normalize whitespace that may be left after removals
+    return re.sub(r'\s+', ' ', cleaned_text).strip()
 
 
 # --- Ingest Endpoint ---
@@ -514,14 +430,16 @@ async def ingest_document(file: UploadFile = File(...)):
             raise HTTPException(status_code=400, detail="No meaningful text found in PDF after cleaning boilerplate.")
 
         splitter = RecursiveCharacterTextSplitter(chunk_size=1500, chunk_overlap=100)
-        split_chunks = splitter.split_documents(processed_documents) # Use processed_documents
+        split_chunks = splitter.split_documents(processed_documents)
 
     except Exception as e:
+        # Ensure file_path is used for cleanup
         if os.path.exists(file_path):
             os.remove(file_path)
         raise HTTPException(status_code=500, detail=f"Failed to process PDF: {e}")
 
     if not split_chunks:
+        # Ensure file_path is used for cleanup
         if os.path.exists(file_path):
             os.remove(file_path)
         raise HTTPException(status_code=400, detail="No text found in PDF or document is empty after chunking.")
@@ -583,10 +501,9 @@ async def handle_query(request: QueryRequest):
         """
     else:
         prompt = f"""
-You are an AI assistant for insurance claim analysis.
-Your task is to determine if a specific surgery mentioned in the User's Query is covered based ONLY on the provided CONTEXT.
-
-First, identify the specific type of surgery from the User's Query.
+You are an AI assistant.
+Your task is to answer the User's Query based ONLY on the provided CONTEXT.
+Do not use any outside knowledge.
 
 --- CONTEXT ---
 {retrieved_context}
@@ -595,10 +512,9 @@ First, identify the specific type of surgery from the User's Query.
 User's Query:
 "{request.query}"
 
-Based solely on the CONTEXT, respond in a single sentence:
-- If the context clearly indicates the identified surgery is covered: "Yes, [identified surgery] is covered under the policy."
-- If the context clearly indicates the identified surgery is NOT covered: "No, [identified surgery] is not covered under the policy."
-- If the CONTEXT does not contain sufficient information to determine coverage for the identified surgery: "The provided context does not contain enough information to answer."
+Based solely on the CONTEXT, provide a concise and direct answer.
+- If the context contains the answer: "[Your concise answer based on context]."
+- If the context does NOT contain the answer: "The provided context does not contain enough information to answer."
         """
 
     llm_response = call_llm(prompt)
@@ -674,10 +590,9 @@ async def hackrx_run(
                     """
                 else:
                     prompt = f"""
-You are an AI assistant for insurance claim analysis.
-Your task is to determine if a specific surgery mentioned in the User's Query is covered based ONLY on the provided CONTEXT.
-
-First, identify the specific type of surgery from the User's Query.
+You are an AI assistant.
+Your task is to answer the User's Query based ONLY on the provided CONTEXT.
+Do not use any outside knowledge.
 
 --- CONTEXT ---
 {retrieved_context}
@@ -686,10 +601,9 @@ First, identify the specific type of surgery from the User's Query.
 User's Query:
 "{question_text}"
 
-Based solely on the CONTEXT, respond in a single sentence:
-- If the context clearly indicates the identified surgery is covered: "Yes, [identified surgery] is covered under the policy."
-- If the context clearly indicates the identified surgery is NOT covered: "No, [identified surgery] is not covered under the policy."
-- If the CONTEXT does not contain sufficient information to determine coverage for the identified surgery: "The provided context does not contain enough information to answer."
+Based solely on the CONTEXT, provide a concise and direct answer.
+- If the context contains the answer: "[Your concise answer based on context]."
+- If the context does NOT contain the answer: "The provided context does not contain enough information to answer."
                     """
                 
                 # Call the LLM
